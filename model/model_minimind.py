@@ -105,6 +105,7 @@ class RMSNorm(torch.nn.Module):
         return self.weight * self._norm(x.float()).type_as(x)
 
 
+# 该函数用于计算rope中的cos和sin值
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
                          rope_scaling: Optional[dict] = None):
     freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -127,7 +128,7 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
     return freqs_cos, freqs_sin
 
-
+# 实现旋转位置编码rope
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
@@ -137,6 +138,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+# 分组注意力机制中，用于复制KV对
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, num_key_value_heads, head_dim = x.shape
@@ -155,13 +157,13 @@ class Attention(nn.Module):
         self.n_local_heads = args.num_attention_heads
         self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.hidden_size // args.num_attention_heads
-        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        self.head_dim = args.hidden_size // args.num_attention_heads   # 每个注意力头的向量维度 = 每个词向量的维度//注意力头个数
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False) # q,k,v矩阵
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
-        self.attn_dropout = nn.Dropout(args.dropout)
-        self.resid_dropout = nn.Dropout(args.dropout)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False) # 该矩阵用于线性变化回到原来的维度
+        self.attn_dropout = nn.Dropout(args.dropout)  # attention_dropout
+        self.resid_dropout = nn.Dropout(args.dropout)  # residual_dropout
         self.dropout = args.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
@@ -172,53 +174,60 @@ class Attention(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
-        bsz, seq_len, _ = x.shape
-        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        # 获得输入文本嵌入的形状，bsz=batchsize 批量大小 代表句子的个数,seq_len=sequence length 序列长度 代表每一句的词数。 这里输入的x的形状是 [bsz, seq_len, hidden_size] 
+        bsz, seq_len, _ = x.shape  
+        # 将文本的嵌入表达分别输入qkv投影矩阵获得qkv值  q: [bsz, seq_len, hidden_size] ----->[bsz, seq_len, n_local_heads*head_dim], kv: [bsz, seq_len, hidden_size] ----->[bsz, seq_len, n_local_kv_heads*head_dim]
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x) 
+        # 调整q的形状，主要是按照注意力头分成 n_local_heads*head_dim 维度的形状，相当于划分出多个专家。 [bsz, seq_len, n_local_heads*head_dim] -----> [bsz, seq_len, n_local_heads, head_dim]
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim) 
+        # 调整k,v的形状，按照注意力头分成 n_local_kv_heads*head_dim 维度的形状 [bsz, seq_len, n_local_kv_heads*head_dim] -----> [bsz, seq_len, n_local_kv_heads, head_dim]  
+        # self.n_rep = self.n_local_heads // self.n_local_kv_heads，可知k,v的注意力头和q差了n_rep倍，后面需要将数据复制n_rep份。这个设计的目的是减少kv的计算量。
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim) 
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-
         cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len]) # 利用rope将文本的位置信息嵌入到q, k中
 
         # kv_cache实现
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (xk, xv) if use_cache else None
+        past_kv = (xk, xv) if use_cache else None  # 缓存计算得到的k,v 这样下次就可以直接用缓存而不用重复计算
 
         xq, xk, xv = (
-            xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
-            repeat_kv(xv, self.n_rep).transpose(1, 2)
+            xq.transpose(1, 2), # 改一下q矩阵第二三维数据的位置[bsz, seq_len, n_local_heads, head_dim]----->[bsz, n_local_heads, seq_len, head_dim]
+            repeat_kv(xk, self.n_rep).transpose(1, 2),  # 对于kv矩阵，除了改位置之外，还要先执行上面说的复制数据的操作，复制完成后qkv的注意力头数相同。
+            repeat_kv(xv, self.n_rep).transpose(1, 2)  # [bsz, seq_len, n_local_kv_heads, head_dim] -----> [bsz, seq_len, n_local_heads, head_dim]----->[bsz, n_local_heads, seq_len, head_dim]
         )
 
-        if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
+        if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)): # 是否使用flash attention高效计算注意力
             attn_mask = (
                 None
                 if attention_mask is None
                 else attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1).bool()
             )
-
+            # 使用Flash Attention高效计算注意力
             output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
-        else:
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        else: # 不使用flash attention就直接计算
+            # 计算注意力分数，q*k的转置/sqrt(head_dim)：[bsz, n_local_heads, seq_len, head_dim]* [bsz, n_local_heads, head_dim，seq_len] = [bsz, n_local_heads, seq_len, seq_len]
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim) 
             scores = scores + torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1
             ).unsqueeze(0).unsqueeze(0)  # scores+mask
 
-            if attention_mask is not None:
+            if attention_mask is not None:  # 应用掩码，让未来的词看不到过去词（因果掩码）
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
 
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)  # 计算 softmax
+            scores = self.attn_dropout(scores)  # 应用注意力 dropout
+            # 根据注意力分数计算最终结果，q*k的转置/sqrt(head_dim)*v：[bsz, n_local_heads, seq_len, seq_len]* [bsz, n_local_heads, seq_len, head_dim] = [bsz, n_local_heads, seq_len, head_dim]
             output = scores @ xv
 
+        # 将结果变化回原来的形状 [bsz, n_local_heads, seq_len, head_dim] -----> [bsz, seq_len, n_local_heads, head_dim] -----> [bsz, seq_len, n_local_heads*head_dim]
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        output = self.resid_dropout(self.o_proj(output))
+        output = self.resid_dropout(self.o_proj(output))  # 用之前说的O投影矩阵，变回与这一层文本嵌入输入相同的形状，输入到下一层 [bsz, seq_len, n_local_heads*head_dim] ----->[bsz, seq_len, hidden_size]
         return output, past_kv
 
 
